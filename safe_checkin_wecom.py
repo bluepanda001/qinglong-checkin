@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# name: QingLong Check-in
+# cron: 20 9 * * *
 """
 Safe Check-in for QingLong
 Sites: NodeSeek / V2EX / 恩山无线论坛
@@ -60,7 +62,7 @@ except Exception:
     cffi_requests = None
 
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
