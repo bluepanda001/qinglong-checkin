@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# QingLong Check-in local/sensitive state
+.safe_checkin_state.json
+.safe_checkin_state.json.tmp
+.env
+*.log
