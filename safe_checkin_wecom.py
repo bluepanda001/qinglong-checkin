@@ -49,10 +49,11 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import ParseResult, parse_qs, urljoin, urlparse
 
 import requests
 
@@ -281,114 +282,275 @@ def nodeseek_checkin(cookie: str, account: int) -> Result:
 
 # =============================== V2EX ===============================
 
-class BalanceParser(HTMLParser):
-    def __init__(self) -> None:
+V2EX_BASE = "https://" + OFFICIAL_HOSTS["v2ex"]
+V2EX_DAILY = "/mission/daily"
+V2EX_REDEEM = V2EX_DAILY + "/redeem"
+V2EX_BALANCE = "/balance"
+V2EX_TZ = timezone(timedelta(hours=8))
+
+
+@dataclass
+class V2EXResult(Result):
+    reward: Optional[int] = None
+    balance: str = ""
+
+    @property
+    def icon(self) -> str:
+        return {"success": "✅", "already": "ℹ️", "pending": "⚠️"}.get(self.status, "❌")
+
+    def details(self) -> list[str]:
+        if self.status == "success":
+            lines = [f"今日奖励：{self.reward} 铜币"]
+            if self.balance:
+                lines.append(f"当前余额：{self.balance}")
+            return lines + ["状态：领取成功"]
+        if self.status == "already":
+            return ["状态：今日已领取", f"今日奖励：{self.reward} 铜币"]
+        status = "到账待确认" if self.status == "pending" else "领取失败"
+        return [f"状态：{status}", f"原因：{self.message}"]
+
+    def line(self) -> str:
+        return "\n".join([f"{self.icon} {self.site} 账号{self.account}", *self.details()])
+
+
+class V2EXPageParser(HTMLParser):
+    def __init__(self, html: str) -> None:
         super().__init__(convert_charrefs=True)
-        self.depth = 0
-        self.values: list[str] = []
+        self.balance_depth = 0
+        self.balance_values: list[str] = []
+        self.rows: list[list[str]] = []
+        self.row: Optional[list[str]] = None
+        self.cell: Optional[list[str]] = None
+        self.actions: list[str] = []
+        self.signin = False
+        self.feed(html)
+        self.close()
 
     def handle_starttag(self, tag, attrs):
-        if tag != "div":
-            return
         attr = dict(attrs)
-        if self.depth:
-            self.depth += 1
-            return
-        classes = set((attr.get("class") or "").split())
-        if "balance_area" in classes and "bigger" in classes:
-            self.depth = 1
+        if tag == "div":
+            classes = set((attr.get("class") or "").split())
+            if self.balance_depth or {"balance_area", "bigger"} <= classes:
+                self.balance_depth += 1
+        elif tag == "tr":
+            self.row = []
+            self.cell = None
+        elif tag in ("td", "th") and self.row is not None:
+            self.cell = []
+        elif tag == "form":
+            action = _v2ex_url(attr.get("action") or "", V2EX_DAILY)
+            if action and action.path == "/signin":
+                self.signin = True
+        elif tag == "a" and attr.get("href"):
+            self.actions.append(attr["href"])
+        elif tag in ("input", "button") and "disabled" not in attr:
+            # Read the URL from the real button attribute without executing JavaScript.
+            match = re.fullmatch(
+                r"""\s*(?:window\.)?location(?:\.href)?\s*=\s*(['"])([^'"]+)\1\s*;?\s*""",
+                attr.get("onclick") or "",
+            )
+            if match:
+                self.actions.append(match[2])
 
     def handle_endtag(self, tag):
-        if tag == "div" and self.depth:
-            self.depth -= 1
+        if tag == "div" and self.balance_depth:
+            self.balance_depth -= 1
+        elif tag in ("td", "th") and self.row is not None and self.cell is not None:
+            self.row.append(" ".join("".join(self.cell).split()))
+            self.cell = None
+        elif tag == "tr" and self.row is not None:
+            self.rows.append(self.row)
+            self.row = self.cell = None
 
     def handle_data(self, data):
-        if self.depth:
-            text = " ".join(data.split())
-            if text:
-                self.values.append(text)
+        if self.balance_depth and data.strip():
+            self.balance_values.append(data.strip())
+        if self.cell is not None:
+            self.cell.append(data)
+
+    def balance(self) -> str:
+        values = self.balance_values
+        if not 1 <= len(values) <= 3:
+            return ""
+        if not all(re.fullmatch(r"[0-9]+", n) for n in values[:-1]):
+            return ""
+        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", values[-1]):
+            return ""
+        units = ("金", "银", "铜")[-len(values):]
+        return " / ".join(
+            f"{n} {unit}" for n, unit in zip(values, units) if unit != "金" or n.strip("0")
+        )
+
+    def redeem_url(self) -> str:
+        candidates = set()
+        for action in self.actions:
+            parsed = _v2ex_url(action, V2EX_DAILY)
+            if not parsed or parsed.path != V2EX_REDEEM or parsed.fragment:
+                continue
+            tokens = parse_qs(parsed.query, keep_blank_values=True).get("once", [])
+            if len(tokens) == 1 and re.fullmatch(r"[A-Za-z0-9_-]+", tokens[0]):
+                candidates.add(parsed.geturl())
+        return candidates.pop() if len(candidates) == 1 else ""
 
 
-def parse_v2ex_balance(html: str) -> str:
-    parser = BalanceParser()
+class V2EXError(Exception):
+    def __init__(self, status: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _v2ex_url(value: str, page: str) -> Optional[ParseResult]:
     try:
-        parser.feed(html)
-    except Exception:
-        return ""
-    vals = [x for x in parser.values if x]
-    if len(vals) == 2:
-        vals = ["0", *vals]
-    if len(vals) >= 3:
-        return f"{vals[0]} 金 / {vals[1]} 银 / {vals[2]} 铜"
-    return ""
+        parsed = urlparse(urljoin(V2EX_BASE + page, value))
+    except ValueError:
+        return None
+    if parsed.scheme == "https" and parsed.netloc == OFFICIAL_HOSTS["v2ex"] and not parsed.params:
+        return parsed
+    return None
+
+
+def _v2ex_get(
+    session: requests.Session, url: str, label: str, *, redeem: bool = False,
+) -> V2EXPageParser:
+    headers = {"Cache-Control": "no-cache"}
+    if redeem:
+        headers["Referer"] = V2EX_BASE + V2EX_DAILY
+    try:
+        response = requests_call(session, "GET", url, "v2ex", allow_redirects=False, headers=headers)
+    except ValueError:
+        raise V2EXError("redirect", f"{label}地址无效") from None
+    if response.status_code == 401:
+        raise V2EXError("cookie_invalid", "Cookie 无效或已过期")
+    if response.is_redirect:
+        target = _v2ex_url(response.headers["Location"], urlparse(url).path)
+        if not target:
+            raise V2EXError("redirect", f"{label}返回非官方重定向")
+        if target.path == "/signin":
+            raise V2EXError("cookie_invalid", "Cookie 无效或已过期")
+        if redeem and target.path in (V2EX_DAILY, V2EX_BALANCE):
+            # V2EX may redirect after redeeming. Verify directly against the ledger.
+            return V2EXPageParser("")
+        raise V2EXError("redirect", f"{label}返回意外重定向")
+    if response.status_code != 200:
+        raise V2EXError("http_error", f"{label} HTTP {response.status_code}")
+    page = V2EXPageParser(response.text)
+    if page.signin:
+        raise V2EXError("cookie_invalid", "Cookie 无效或已过期")
+    return page
+
+
+def _v2ex_transactions(page: V2EXPageParser) -> list[tuple[datetime, str, str]]:
+    transactions = []
+    has_header = False
+    for row in page.rows:
+        if len(row) < 5:
+            continue
+        stamp, kind, amount = row[:3]
+        if stamp in ("时间", "交易时间") and kind in ("类型", "交易类型"):
+            has_header = True
+            continue
+        try:
+            occurred = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S %z").astimezone(V2EX_TZ)
+        except ValueError:
+            continue
+        transactions.append((occurred, kind, amount))
+    if not transactions and not has_header:
+        raise V2EXError("parse_error", "无法识别账户流水")
+    return transactions
+
+
+def _v2ex_balance(
+    session: requests.Session, since: datetime,
+) -> tuple[Optional[tuple[datetime, int]], str]:
+    url = V2EX_BASE + V2EX_BALANCE
+    balance = ""
+    # Recent rows appear first. Look at up to three pages if today spans multiple pages.
+    for number in range(1, 4):
+        page = _v2ex_get(session, url, "账户流水")
+        if number == 1:
+            balance = page.balance()
+        transactions = _v2ex_transactions(page)
+        rewards = []
+        for occurred, kind, amount in transactions:
+            if kind != "每日登录奖励" or occurred < since or occurred.date() != since.date():
+                continue
+            # This column is the transaction delta, separate from the running total.
+            delta = re.fullmatch(r"\+?([0-9]+)(?:\.0+)?", amount)
+            if delta and int(delta[1]) > 0:
+                rewards.append((occurred, int(delta[1])))
+        if rewards:
+            return max(rewards), balance
+        if not transactions or min(row[0] for row in transactions) < since:
+            break
+        url = f"{V2EX_BASE}{V2EX_BALANCE}?p={number + 1}"
+        next_page = urlparse(url)
+        if not any(_v2ex_url(link, V2EX_BALANCE) == next_page for link in page.actions):
+            break
+    return None, balance
+
+
+def _v2ex_reward_window(now: datetime) -> datetime:
+    # V2EX starts its next reward day at 08:00 Beijing time (00:00 UTC).
+    reset = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    return reset if now >= reset else reset.replace(hour=0)
 
 
 def v2ex_checkin(cookie: str, account: int) -> Result:
-    base = "https://www.v2ex.com"
-    daily = base + "/mission/daily"
-    balance_url = base + "/balance"
-    for u in (daily, balance_url):
-        assert_official_url(u, "v2ex")
+    since = _v2ex_reward_window(datetime.now(V2EX_TZ))
+    daily = V2EX_BASE + V2EX_DAILY
 
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": USER_AGENT,
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
-            "Cookie": cookie,
-        }
-    )
-
-    login_markers = ("需要先登录", "Sign In", "/signin")
-    already_markers = ("每日登录奖励已领取", "已领取", "已完成今日")
-
-    try:
-        r = requests_call(session, "GET", daily, "v2ex")
-        if r.status_code != 200:
-            return Result("V2EX", account, False, "http_error", f"每日任务页 HTTP {r.status_code}")
-        body = r.text
-        if any(m in body for m in login_markers):
-            return Result("V2EX", account, False, "cookie_invalid", "Cookie 无效或已过期")
-
-        claimed = any(m in body for m in already_markers)
-        action_msg = "今日已签到" if claimed else ""
-
-        if not claimed:
-            match = re.search(r'(/mission/daily/redeem\?once=[A-Za-z0-9_-]+)', body)
-            if not match:
-                return Result("V2EX", account, False, "parse_error", "未找到领取链接，页面结构可能已变化")
-            redeem = urljoin(base, match.group(1))
-            assert_official_url(redeem, "v2ex")
-            rr = requests_call(session, "GET", redeem, "v2ex", headers={"Referer": daily, "User-Agent": USER_AGENT, "Cookie": cookie})
-            if rr.status_code != 200:
-                return Result("V2EX", account, False, "http_error", f"领取请求 HTTP {rr.status_code}")
-
-            # Confirm from the official daily page instead of trusting one response.
-            vr = requests_call(session, "GET", daily, "v2ex")
-            verify_text = vr.text
-            if any(m in verify_text for m in login_markers):
-                return Result("V2EX", account, False, "cookie_invalid", "签到后登录状态失效")
-            if any(m in verify_text for m in already_markers) or "每日登录奖励" in rr.text:
-                action_msg = "签到成功"
-            else:
-                return Result("V2EX", account, False, "verify_failed", "领取后无法确认签到状态")
-
-        balance = ""
+    with requests.Session() as session:
+        session.headers.update(
+            {
+                "User-Agent": USER_AGENT,
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+                "Cookie": cookie,
+            }
+        )
         try:
-            br = requests_call(session, "GET", balance_url, "v2ex")
-            if br.status_code == 200:
-                balance = parse_v2ex_balance(br.text)
-        except Exception:
-            balance = ""
+            reward, balance = _v2ex_balance(session, since)
+            if reward:
+                return V2EXResult("V2EX", account, True, "already", "", reward[1], balance)
+            mission = _v2ex_get(session, daily, "每日任务页")
+            redeem = mission.redeem_url()
+            sent_at = None
+            reason = "未找到有效领取链接"
+            if redeem:
+                sent_at = datetime.now(V2EX_TZ).replace(microsecond=0)
+                if _v2ex_reward_window(sent_at) != since:
+                    raise V2EXError("pending", "核对期间奖励日期已切换")
+                reason = ""
+                try:
+                    _v2ex_get(session, redeem, "领取请求", redeem=True)
+                except requests.RequestException as exc:
+                    # The request may have reached V2EX. Poll the ledger without resending it.
+                    reason = f"领取请求未收到确认（{type(exc).__name__}）"
 
-        msg = action_msg
-        if balance:
-            msg += f"；余额 {balance}"
-        return Result("V2EX", account, True, "success", msg)
-    except Exception as exc:
-        return Result("V2EX", account, False, "error", f"请求失败: {type(exc).__name__}")
-    finally:
-        session.close()
+            for delay in (0, 1, 2):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    reward, balance = _v2ex_balance(session, since)
+                except V2EXError as exc:
+                    if exc.status in ("cookie_invalid", "redirect"):
+                        raise
+                    verification = str(exc)
+                    continue
+                except requests.RequestException as exc:
+                    verification = f"流水查询失败（{type(exc).__name__}）"
+                    continue
+                if reward:
+                    status = "success" if sent_at and reward[0] >= sent_at else "already"
+                    return V2EXResult("V2EX", account, True, status, "", reward[1], balance)
+                verification = "未检测到今日奖励流水"
+
+            return V2EXResult(
+                "V2EX", account, False, "pending", "；".join(filter(None, (reason, verification))),
+            )
+        except V2EXError as exc:
+            return V2EXResult("V2EX", account, False, exc.status, str(exc))
+        except requests.RequestException as exc:
+            return V2EXResult("V2EX", account, False, "error", f"请求失败（{type(exc).__name__}）")
 
 
 # =============================== 恩山 ===============================
@@ -688,14 +850,22 @@ def enshan_checkin(cookie: str, account: int, state: Optional[dict] = None) -> R
 
 def _wecom_markdown(results: Iterable[Result]) -> str:
     items = list(results)
-    ok_count = sum(1 for r in items if r.ok)
-    fail_count = sum(1 for r in items if not r.ok)
-    lines = [
-        "## 🔐 Safe Check-in",
-        f"> 成功：<font color=\"info\">{ok_count}</font>　失败：<font color=\"warning\">{fail_count}</font>",
-        "",
-    ]
+    already = sum(1 for r in items if isinstance(r, V2EXResult) and r.status == "already")
+    pending = sum(1 for r in items if isinstance(r, V2EXResult) and r.status == "pending")
+    ok_count = sum(1 for r in items if r.ok) - already
+    fail_count = sum(1 for r in items if not r.ok) - pending
+    summary = f'> 成功：<font color="info">{ok_count}</font>　失败：<font color="warning">{fail_count}</font>'
+    if already:
+        summary += f"　已领取：{already}"
+    if pending:
+        summary += f"　待确认：{pending}"
+    lines = ["## 🔐 Safe Check-in", summary, ""]
     for r in items:
+        if isinstance(r, V2EXResult):
+            lines.append(f"{r.icon} **{r.site} 账号{r.account}**")
+            lines.extend(f"> {line}" for line in r.details())
+            lines.append("")
+            continue
         color = "info" if r.ok else "warning"
         status = "✅" if r.ok else "❌"
         # r.message is sanitized and never contains Cookie/Token values.
