@@ -2,6 +2,8 @@ import io
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime as RealDatetime
+from email.message import Message
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
@@ -53,13 +55,18 @@ ORIGINAL = ledger(YESTERDAY)
 UPDATED = ledger(TODAY, YESTERDAY, copper=77)
 
 
-def response(body="", status=200, location=None):
+def response(body="", status=200, location=None, set_cookie=None):
     result = Response()
     result.status_code = status
     result.encoding = "utf-8"
     result._content = body.encode("utf-8")
     if location is not None:
         result.headers["Location"] = location
+    if set_cookie is not None:
+        # Let Requests extract Set-Cookie from the HTTP response as it does in production.
+        message = Message()
+        message["Set-Cookie"] = set_cookie
+        result.raw = SimpleNamespace(_original_response=SimpleNamespace(msg=message))
     return result
 
 
@@ -130,6 +137,36 @@ class V2EXTests(unittest.TestCase):
         self.assertIn("今日奖励：3 铜币", result.line())
         self.assertIn("当前余额：55 银 / 77 铜", result.line())
         self.assert_claim_count(1)
+
+    def test_renewed_session_cookie_is_used_for_each_following_request(self):
+        self.queue(
+            BALANCE,
+            response(ORIGINAL, set_cookie="PB3_SESSION=balance-renewed; Path=/; Secure; HttpOnly"),
+            response(UPDATED),
+        )
+        self.queue(
+            DAILY,
+            response(MISSION, set_cookie="PB3_SESSION=mission-renewed; Path=/; Secure; HttpOnly"),
+        )
+        self.queue(
+            REDEEM,
+            response(
+                status=302, location=DAILY,
+                set_cookie="PB3_SESSION=redeem-renewed; Path=/; Secure; HttpOnly",
+            ),
+        )
+
+        self.assertEqual(self.checkin().status, "success")
+        self.assertEqual(
+            [(cookies, path) for cookies, path, _ in self.sent],
+            [
+                ("PB3_SESSION=example; A2=first", BALANCE),
+                ("PB3_SESSION=balance-renewed; A2=first", DAILY),
+                ("PB3_SESSION=mission-renewed; A2=first", REDEEM),
+                ("PB3_SESSION=redeem-renewed; A2=first", BALANCE),
+            ],
+        )
+        self.assertEqual(self.sent[2][2], BASE + DAILY)
 
     def test_existing_row_skips_redeem(self):
         self.queue(BALANCE, response(UPDATED))
