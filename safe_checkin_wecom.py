@@ -50,6 +50,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable, Optional
@@ -63,7 +64,7 @@ except Exception:
     cffi_requests = None
 
 
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -287,25 +288,30 @@ V2EX_DAILY = "/mission/daily"
 V2EX_REDEEM = V2EX_DAILY + "/redeem"
 V2EX_BALANCE = "/balance"
 V2EX_TZ = timezone(timedelta(hours=8))
+V2EX_READ_RETRY_DELAYS = (1, 2, None)
+V2EX_MAX_RETRY_DELAY = 10
+V2EX_COOKIE_EXPIRED = "Cookie 无效或已过期，请更新 Cookie"
 
 
 @dataclass
 class V2EXResult(Result):
     reward: Optional[int] = None
     balance: str = ""
+    streak_days: Optional[int] = None
 
     @property
     def icon(self) -> str:
         return {"success": "✅", "already": "ℹ️", "pending": "⚠️"}.get(self.status, "❌")
 
     def details(self) -> list[str]:
-        if self.status == "success":
-            lines = [f"今日奖励：{self.reward} 铜币"]
+        if self.status in ("success", "already"):
+            status = "领取成功" if self.status == "success" else "今日已领取"
+            lines = [f"状态：{status}", f"今日奖励：{self.reward} 铜币"]
+            if self.streak_days is not None:
+                lines.append(f"连续签到：{self.streak_days} 天")
             if self.balance:
                 lines.append(f"当前余额：{self.balance}")
-            return lines + ["状态：领取成功"]
-        if self.status == "already":
-            return ["状态：今日已领取", f"今日奖励：{self.reward} 铜币"]
+            return lines
         status = "到账待确认" if self.status == "pending" else "领取失败"
         return [f"状态：{status}", f"原因：{self.message}"]
 
@@ -323,12 +329,17 @@ class V2EXPageParser(HTMLParser):
         self.cell: Optional[list[str]] = None
         self.actions: list[str] = []
         self.signin = False
+        self._text_parts: list[str] = []
+        self._ignore_text = False
         self.feed(html)
         self.close()
+        self.text = " ".join(" ".join(self._text_parts).split())
 
     def handle_starttag(self, tag, attrs):
         attr = dict(attrs)
-        if tag == "div":
+        if tag in ("script", "style"):
+            self._ignore_text = True
+        elif tag == "div":
             classes = set((attr.get("class") or "").split())
             if self.balance_depth or {"balance_area", "bigger"} <= classes:
                 self.balance_depth += 1
@@ -353,7 +364,9 @@ class V2EXPageParser(HTMLParser):
                 self.actions.append(match[2])
 
     def handle_endtag(self, tag):
-        if tag == "div" and self.balance_depth:
+        if tag in ("script", "style"):
+            self._ignore_text = False
+        elif tag == "div" and self.balance_depth:
             self.balance_depth -= 1
         elif tag in ("td", "th") and self.row is not None and self.cell is not None:
             self.row.append(" ".join("".join(self.cell).split()))
@@ -363,10 +376,28 @@ class V2EXPageParser(HTMLParser):
             self.row = self.cell = None
 
     def handle_data(self, data):
+        if self._ignore_text:
+            return
+        self._text_parts.append(data)
         if self.balance_depth and data.strip():
             self.balance_values.append(data.strip())
         if self.cell is not None:
             self.cell.append(data)
+
+    def claimed(self) -> bool:
+        text = self.text.lower()
+        return any(marker in text for marker in (
+            "每日登录奖励已领取",
+            "今日的登录奖励已领取",
+            "daily login reward has been claimed",
+        ))
+
+    def reclick_requested(self) -> bool:
+        return bool(re.search(r"请重新点击一次\s*以\s*领取每日登录奖励", self.text))
+
+    def streak_days(self) -> Optional[int]:
+        counts = set(re.findall(r"已连续登录\s*([1-9][0-9]{0,5})\s*天", self.text))
+        return int(counts.pop()) if len(counts) == 1 else None
 
     def balance(self) -> str:
         values = self.balance_values
@@ -394,9 +425,10 @@ class V2EXPageParser(HTMLParser):
 
 
 class V2EXError(Exception):
-    def __init__(self, status: str, message: str) -> None:
+    def __init__(self, status: str, message: str, *, retry_after: Optional[str] = None) -> None:
         super().__init__(message)
         self.status = status
+        self.retry_after = retry_after
 
 
 def _v2ex_url(value: str, page: str) -> Optional[ParseResult]:
@@ -412,31 +444,78 @@ def _v2ex_url(value: str, page: str) -> Optional[ParseResult]:
 def _v2ex_get(
     session: requests.Session, url: str, label: str, *, redeem: bool = False,
 ) -> V2EXPageParser:
+    requested = _v2ex_url(url, V2EX_DAILY)
+    allowed_paths = (V2EX_REDEEM,) if redeem else (V2EX_DAILY, V2EX_BALANCE)
+    if not requested or requested.path not in allowed_paths or requested.fragment:
+        raise V2EXError("redirect", f"{label}地址不符合官方路径")
     headers = {"Cache-Control": "no-cache"}
     if redeem:
         headers["Referer"] = V2EX_BASE + V2EX_DAILY
     try:
-        response = requests_call(session, "GET", url, "v2ex", allow_redirects=False, headers=headers)
+        response = requests_call(
+            session, "GET", requested.geturl(), "v2ex", allow_redirects=False, headers=headers,
+        )
     except ValueError:
         raise V2EXError("redirect", f"{label}地址无效") from None
-    if response.status_code == 401:
-        raise V2EXError("cookie_invalid", "Cookie 无效或已过期")
+    if response.headers.get("cf-mitigated", "").strip().lower() == "challenge":
+        raise V2EXError("access_denied", f"{label}需要站点验证")
+    status = response.status_code
+    if status == 401:
+        raise V2EXError("cookie_invalid", V2EX_COOKIE_EXPIRED)
     if response.is_redirect:
-        target = _v2ex_url(response.headers["Location"], urlparse(url).path)
+        target = _v2ex_url(response.headers["Location"], requested.path)
         if not target:
             raise V2EXError("redirect", f"{label}返回非官方重定向")
         if target.path == "/signin":
-            raise V2EXError("cookie_invalid", "Cookie 无效或已过期")
+            raise V2EXError("cookie_invalid", V2EX_COOKIE_EXPIRED)
         if redeem and target.path in (V2EX_DAILY, V2EX_BALANCE):
             # V2EX may redirect after redeeming. Verify directly against the ledger.
             return V2EXPageParser("")
         raise V2EXError("redirect", f"{label}返回意外重定向")
-    if response.status_code != 200:
-        raise V2EXError("http_error", f"{label} HTTP {response.status_code}")
-    page = V2EXPageParser(response.text)
+    if status != 200:
+        retry_after = response.headers.get("Retry-After", "") if status == 429 or 500 <= status < 600 else None
+        raise V2EXError("http_error", f"{label} HTTP {status}", retry_after=retry_after)
+    try:
+        page = V2EXPageParser(response.text)
+    except (AssertionError, ValueError):
+        raise V2EXError("parse_error", f"{label} HTML 无法解析") from None
     if page.signin:
-        raise V2EXError("cookie_invalid", "Cookie 无效或已过期")
+        raise V2EXError("cookie_invalid", V2EX_COOKIE_EXPIRED)
     return page
+
+
+def _v2ex_retry_delay(error: Exception, default: Optional[int]) -> Optional[float]:
+    if default is None:
+        return None
+    if isinstance(error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return None if isinstance(error, requests.exceptions.SSLError) else default
+    if not isinstance(error, V2EXError) or error.retry_after is None:
+        return None
+
+    value = error.retry_after.strip()
+    delay = float(default)
+    if value.isascii() and value.isdecimal():
+        delay = max(delay, float(value))
+    elif value:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (ValueError, TypeError, OverflowError):
+            return delay
+        if retry_at.tzinfo is not None:
+            delay = max(delay, (retry_at - datetime.now(timezone.utc)).total_seconds())
+    # If the server requires a longer wait, defer to the next scheduled run.
+    return delay if delay <= V2EX_MAX_RETRY_DELAY else None
+
+
+def _v2ex_read(session: requests.Session, url: str, label: str) -> V2EXPageParser:
+    for default in V2EX_READ_RETRY_DELAYS:
+        try:
+            return _v2ex_get(session, url, label)
+        except (V2EXError, requests.RequestException) as exc:
+            delay = _v2ex_retry_delay(exc, default)
+            if delay is None:
+                raise
+            time.sleep(delay)
 
 
 def _v2ex_transactions(page: V2EXPageParser) -> list[tuple[datetime, str, str]]:
@@ -460,19 +539,21 @@ def _v2ex_transactions(page: V2EXPageParser) -> list[tuple[datetime, str, str]]:
 
 
 def _v2ex_balance(
-    session: requests.Session, since: datetime,
+    session: requests.Session, since: datetime, *, retry_read: bool = False,
 ) -> tuple[Optional[tuple[datetime, int]], str]:
     url = V2EX_BASE + V2EX_BALANCE
     balance = ""
+    until = since + timedelta(days=1)
+    get_page = _v2ex_read if retry_read else _v2ex_get
     # Recent rows appear first. Look at up to three pages if today spans multiple pages.
     for number in range(1, 4):
-        page = _v2ex_get(session, url, "账户流水")
+        page = get_page(session, url, "账户流水")
         if number == 1:
             balance = page.balance()
         transactions = _v2ex_transactions(page)
         rewards = []
         for occurred, kind, amount in transactions:
-            if kind != "每日登录奖励" or occurred < since or occurred.date() != since.date():
+            if kind != "每日登录奖励" or not since <= occurred < until:
                 continue
             # This column is the transaction delta, separate from the running total.
             delta = re.fullmatch(r"\+?([0-9]+)(?:\.0+)?", amount)
@@ -491,8 +572,25 @@ def _v2ex_balance(
 
 def _v2ex_reward_window(now: datetime) -> datetime:
     # V2EX starts its next reward day at 08:00 Beijing time (00:00 UTC).
+    now = now.astimezone(V2EX_TZ)
     reset = now.replace(hour=8, minute=0, second=0, microsecond=0)
-    return reset if now >= reset else reset.replace(hour=0)
+    return reset if now >= reset else reset - timedelta(days=1)
+
+
+def _v2ex_optional_daily(session: requests.Session) -> Optional[V2EXPageParser]:
+    try:
+        return _v2ex_get(session, V2EX_BASE + V2EX_DAILY, "每日任务页")
+    except (V2EXError, requests.RequestException):
+        return None
+
+
+def _v2ex_verified_result(
+    session: requests.Session, account: int, status: str, reward: int, balance: str,
+    completed_page: Optional[V2EXPageParser] = None,
+) -> V2EXResult:
+    completed_page = completed_page or _v2ex_optional_daily(session)
+    streak = completed_page.streak_days() if completed_page and completed_page.claimed() else None
+    return V2EXResult("V2EX", account, True, status, "", reward, balance, streak)
 
 
 def v2ex_checkin(cookie: str, account: int) -> Result:
@@ -514,41 +612,56 @@ def v2ex_checkin(cookie: str, account: int) -> Result:
                     name.strip(), value.strip(), domain=OFFICIAL_HOSTS["v2ex"], path="/", secure=True,
                 )
         try:
-            reward, balance = _v2ex_balance(session, since)
+            reward, balance = _v2ex_balance(session, since, retry_read=True)
             if reward:
-                return V2EXResult("V2EX", account, True, "already", "", reward[1], balance)
-            mission = _v2ex_get(session, daily, "每日任务页")
-            redeem = mission.redeem_url()
+                return _v2ex_verified_result(session, account, "already", reward[1], balance)
+            mission = _v2ex_read(session, daily, "每日任务页")
+            completed_page = mission if mission.claimed() else None
+            redeem = "" if completed_page else mission.redeem_url()
             sent_at = None
-            reason = "未找到有效领取链接"
+            reason = "任务页显示已领取" if completed_page else "未找到有效领取链接"
             if redeem:
                 sent_at = datetime.now(V2EX_TZ).replace(microsecond=0)
                 if _v2ex_reward_window(sent_at) != since:
                     raise V2EXError("pending", "核对期间奖励日期已切换")
                 reason = ""
                 try:
-                    _v2ex_get(session, redeem, "领取请求", redeem=True)
+                    reply = _v2ex_get(session, redeem, "领取请求", redeem=True)
                 except requests.RequestException as exc:
                     # The request may have reached V2EX. Poll the ledger without resending it.
                     reason = f"领取请求未收到确认（{type(exc).__name__}）"
+                else:
+                    if reply.claimed():
+                        completed_page = reply
+                    if reply.reclick_requested():
+                        reason = "站点提示重新点击领取"
 
-            for delay in (0, 1, 2):
-                if delay:
-                    time.sleep(delay)
+            for default in V2EX_READ_RETRY_DELAYS:
                 try:
                     reward, balance = _v2ex_balance(session, since)
                 except V2EXError as exc:
                     if exc.status in ("cookie_invalid", "redirect"):
                         raise
                     verification = str(exc)
-                    continue
+                    delay = _v2ex_retry_delay(exc, default)
                 except requests.RequestException as exc:
                     verification = f"流水查询失败（{type(exc).__name__}）"
-                    continue
-                if reward:
-                    status = "success" if sent_at and reward[0] >= sent_at else "already"
-                    return V2EXResult("V2EX", account, True, status, "", reward[1], balance)
-                verification = "未检测到今日奖励流水"
+                    delay = _v2ex_retry_delay(exc, default)
+                else:
+                    if reward:
+                        status = "success" if sent_at and reward[0] >= sent_at else "already"
+                        return _v2ex_verified_result(session, account, status, reward[1], balance, completed_page)
+                    verification = "未检测到今日奖励流水"
+                    if default is None and sent_at and not reason and not completed_page:
+                        status_page = _v2ex_optional_daily(session)
+                        if status_page and status_page.reclick_requested():
+                            reason = "站点提示重新点击领取"
+                        elif status_page and status_page.claimed():
+                            reason = "任务页显示已领取"
+                    delay = default
+                if delay is None:
+                    break
+                time.sleep(delay)
 
             return V2EXResult(
                 "V2EX", account, False, "pending", "；".join(filter(None, (reason, verification))),
@@ -935,7 +1048,10 @@ def run_site(site: str, cookies: list[str], state: Optional[dict] = None) -> lis
         if site == "nodeseek":
             result = nodeseek_checkin(cookie, idx)
         elif site == "v2ex":
-            result = v2ex_checkin(cookie, idx)
+            try:
+                result = v2ex_checkin(cookie, idx)
+            except Exception as exc:
+                result = V2EXResult("V2EX", idx, False, "error", f"账号处理异常（{type(exc).__name__}）")
         elif site == "enshan":
             result = enshan_checkin(cookie, idx, state)
         else:
