@@ -63,7 +63,7 @@ except Exception:
     cffi_requests = None
 
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -504,9 +504,15 @@ def v2ex_checkin(cookie: str, account: int) -> Result:
             {
                 "User-Agent": USER_AGENT,
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
-                "Cookie": cookie,
             }
         )
+        # Let V2EX's host-scoped Set-Cookie replace the initial session before redeeming.
+        for part in cookie.split(";"):
+            name, separator, value = part.partition("=")
+            if separator and name.strip():
+                session.cookies.set(
+                    name.strip(), value.strip(), domain=OFFICIAL_HOSTS["v2ex"], path="/", secure=True,
+                )
         try:
             reward, balance = _v2ex_balance(session, since)
             if reward:
